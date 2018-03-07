@@ -65,6 +65,14 @@ void ofApp::setup(){
 	gui.add(circlePointX.setup("circle center x", colorWidth/2, 0, colorWidth));
 	gui.add(circlePointY.setup("circle center y", colorHeight/2, 0, colorHeight));
 	gui.add(depthOrcolor.setup("color or depth", true));
+	gui.add(detectThreshold.setup("cv threshold", 200, 1, 400));
+	gui.add(cvMinArea.setup("cv min area", 10, 1, 200));
+	gui.add(cvMaxArea.setup("cv max area", 2000, 1, 100000));
+	gui.add(cvMaxTrackRect.setup("cv max track", 10, 1, MAX_CV_TRACK_RECT));
+	gui.add(oscSendFrameCounter.setup("osc send frame%counter", 30, 10, 300));
+
+	// OSC用
+	oscSender.setup(SERVER_IP_ADDR, SERVER_PORT);
 }
 
 //--------------------------------------------------------------
@@ -84,13 +92,6 @@ void ofApp::update(){
 		ERROR_CHECK(depthFrame->CopyFrameDataToArray(depthBuffer.size(), &depthBuffer[0]));
 	}
 
-
-}
-
-//--------------------------------------------------------------
-void ofApp::draw(){
-	ofSetColor(255, 255, 255);
-
 	ComPtr<ICoordinateMapper> mapper;
 	ERROR_CHECK(kinect->get_CoordinateMapper(&mapper));
 
@@ -98,11 +99,21 @@ void ofApp::draw(){
 	ERROR_CHECK(mapper->MapColorFrameToDepthSpace(depthBuffer.size(), &depthBuffer[0],
 		depthSpacePoints.size(), &depthSpacePoints[0]));
 
-	// カラーデータを表示する
-	ofImage colorImage;
-	colorImage.allocate(colorWidth, colorHeight, OF_IMAGE_COLOR_ALPHA);
-	unsigned char *data = colorImage.getPixels().getData();
+	// 重心データのクリア
+	trackRectCenters.clear();
 
+	// 各種メモリ確保
+	if (!colorImage.isAllocated())
+		colorImage.allocate(colorWidth, colorHeight, OF_IMAGE_COLOR_ALPHA);
+
+	if (!depthImage.isAllocated())
+		depthImage.allocate(colorWidth, colorHeight, OF_IMAGE_GRAYSCALE);
+
+	// アクセス用ポインタ取得
+	unsigned char *dataColor = colorImage.getPixels().getData();
+	unsigned char *dataDepth = depthImage.getPixels().getData();
+
+	// depth/colorデータ取得
 	for (int j = 0; j < colorImage.getWidth(); ++j) {
 		for (int i = 0; i < colorImage.getHeight(); ++i) {
 			int idx = i * colorImage.getWidth() + j;
@@ -114,56 +125,109 @@ void ofApp::draw(){
 
 			if (isInColorCircle(j, i) && isValidColorRange(x, y) && isValidDepthRange(depthIndex)) {
 				if (depthOrcolor) {
-					data[colorIndex + 0] = colorBuffer[colorIndex + 0];
-					data[colorIndex + 1] = colorBuffer[colorIndex + 1];
-					data[colorIndex + 2] = colorBuffer[colorIndex + 2];
-					data[colorIndex + 3] = 255;
+					dataColor[colorIndex + 0] = colorBuffer[colorIndex + 0];
+					dataColor[colorIndex + 1] = colorBuffer[colorIndex + 1];
+					dataColor[colorIndex + 2] = colorBuffer[colorIndex + 2];
+					dataColor[colorIndex + 3] = 255;
+				} else {
+					// ここで完全に二値可しても良い
+					dataDepth[idx] = ~((depthBuffer[depthIndex] * 255) / maxDepthReliableDistance);
 				}
-				else {
-					data[colorIndex + 0] = ~((depthBuffer[depthIndex] * 255) / maxDepthReliableDistance);
-					data[colorIndex + 1] = ~((depthBuffer[depthIndex] * 255) / maxDepthReliableDistance);
-					data[colorIndex + 2] = ~((depthBuffer[depthIndex] * 255) / maxDepthReliableDistance);
-					data[colorIndex + 3] = 255;
+			} else {
+				if (depthOrcolor) {
+					dataColor[colorIndex + 0] = 0;
+					dataColor[colorIndex + 1] = 0;
+					dataColor[colorIndex + 2] = 0;
+					dataColor[colorIndex + 3] = 255;
+				} else {
+					dataDepth[idx] = 0;
 				}
-			}
-			else {
-				data[colorIndex + 0] = 0;
-				data[colorIndex + 1] = 0;
-				data[colorIndex + 2] = 0;
-				data[colorIndex + 3] = 255;
 			}
 		}
 	}
 
-	colorImage.update();
-	colorImage.draw(0, 0);
+	if (depthOrcolor) {
+		colorImage.update();
+	} else {
+		// colorImage に対してOpenCVで矩形探索
+		depthImage.update();
+		dataDepth = depthImage.getPixels().getData();
 
-	// colorImage に対してOpenCVで矩形探索
+		ofxCvContourFinder cvCountourFinder;
+		ofxCvGrayscaleImage cvGrayScaleImage;
+		cvGrayScaleImage.setFromPixels(dataDepth, depthImage.getWidth(), depthImage.getHeight());
+		cvGrayScaleImage.threshold(detectThreshold);
+		cvCountourFinder.findContours(cvGrayScaleImage, cvMinArea, cvMaxArea, cvMaxTrackRect, false);
 
-	// 特定した矩形毎に重心のデータを特定
+		// 特定した矩形毎に重心特定
+		for (int i = 0; i < cvCountourFinder.nBlobs; i++) {
+			int x = 0, y = 0;
+			for (int j = 0; j < cvCountourFinder.blobs[i].pts.size(); j++) {
+				x += cvCountourFinder.blobs[i].pts[j].x;
+				y += cvCountourFinder.blobs[i].pts[j].y;
+			}
+			x /= cvCountourFinder.blobs[i].pts.size();
+			y /= cvCountourFinder.blobs[i].pts.size();
 
-	// 重心データをOSCで送信
-
-	/*
-	// depth用
-	ofImage image;
-	image.allocate(depthWidth, depthHeight, OF_IMAGE_GRAYSCALE);
-
-	unsigned char *data = image.getPixels().getData();
-	for (int i = 0; i < depthHeight * depthWidth; ++i) {
-		data[i] = ~((depthBuffer[i] * 255) / 8000);
+			trackRectCenters.push_back(ofPoint(x, y));
+		}
 	}
-	image.update();
-	image.draw(0, 0);
-	*/
 
-	ofNoFill();
+	// 重心データをOSCで送信(oscSendFrameCounterフレームカウンター毎に)
+	if (trackRectCenters.size() > 0 && ofGetFrameNum() % oscSendFrameCounter == 0) {
+		for (int i = 0; i < trackRectCenters.size(); i++) {
+			// circlePointX, circlePointY を使って座標変換した方がよさげ
+			// 重心座標(x, y)と、矩形の輪郭点のカメラからの距離平均(z=大体の高さ)を送信
+			
+			// 距離を特定(存在しない事はありえない)
+			int idx = trackRectCenters[i].y * colorImage.getWidth() + trackRectCenters[i].x;
+			int depthX = (int)depthSpacePoints[idx].X;
+			int depthY = (int)depthSpacePoints[idx].Y;
+			int depthIndex = (depthY * depthWidth) + depthX;
+			int z = 0;
+			if (isValidDepthRange(depthIndex)) {
+				z = depthBuffer[depthIndex];
+			}
+
+			ofxOscMessage message;
+			message.setAddress(OSC_ADDRESS);
+			message.addIntArg(trackRectCenters[i].x);
+			message.addIntArg(trackRectCenters[i].y);
+			if (z >= 0)	message.addIntArg(z);
+
+			// 送信ログ
+			std::cout << "OSC Send Mesage" << trackRectCenters[i].x << ":" << trackRectCenters[i].y << ":" << z << std::endl;
+
+			// データ送信
+			// oscSender.sendMessage(message);
+		}
+	}
+}
+
+//--------------------------------------------------------------
+void ofApp::draw(){
 	ofSetColor(255, 255, 255);
-	ofDrawCircle(ofPoint((float)circlePointX, (float)circlePointY), circleResolution);
 
+	// color or depth の表示
+	if (depthOrcolor) {
+		colorImage.draw(0, 0);
+	} else {
+		depthImage.draw(0, 0);
+	}
+
+	// メニューの表示
 	if (showMenu) {
 		ofSetColor(0, 0, 0);
 		gui.draw();
+	}
+
+	// 重心の画面表示用
+	if (trackRectCenters.size() > 0) {
+		ofSetColor(255, 0, 0);
+		ofFill();
+		for (int i = 0; i < trackRectCenters.size(); i++) {
+			ofDrawCircle(trackRectCenters[i], 2);
+		}
 	}
 }
 

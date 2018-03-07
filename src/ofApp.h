@@ -14,8 +14,10 @@
         throw std::runtime_error( ss.str().c_str() );			\
 }
 
-#define SERVER_PORT
-#define SERVER_IP_ADDR
+#define SERVER_PORT       8888
+#define SERVER_IP_ADDR    "192.168.0.2"
+#define OSC_ADDRESS		  "/kinect/track"
+#define MAX_CV_TRACK_RECT	100
 
 class ofApp : public ofBaseApp{
 
@@ -66,5 +68,11 @@ class ofApp : public ofBaseApp{
 		ofxIntSlider circlePointX;
 		ofxIntSlider circlePointY;
 		ofxToggle  depthOrcolor;
+		ofxIntSlider detectThreshold, cvMinArea, cvMaxArea, cvMaxTrackRect;
+		ofxIntSlider oscSendFrameCounter;
 		bool showMenu = true;
+		vector <ofPoint> trackRectCenters;
+		ofImage colorImage, depthImage;
+
+		ofxOscSender oscSender;
 };
